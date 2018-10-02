@@ -117,7 +117,7 @@ require(['jquery', 'underscore', 'utils', 'video', 'soundchip', 'ddnoise', 'debu
         function guessModelFromUrl() {
             if (window.location.hostname.indexOf("bbc") === 0) return "B";
             if (window.location.hostname.indexOf("master") === 0) return "Master";
-            return "B";
+            return "B-Econet";
         }
 
         var model = models.findModel(parsedQuery.model || guessModelFromUrl());

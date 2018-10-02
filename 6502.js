@@ -1,5 +1,5 @@
-define(['./utils', './6502.opcodes', './via', './acia', './serial', './tube', './adc', './scheduler', './touchscreen'],
-    function (utils, opcodesAll, via, Acia, Serial, Tube, Adc, scheduler, TouchScreen) {
+define(['./utils', './6502.opcodes', './via', './acia', './serial', './tube', './adc', './econet', './scheduler', './touchscreen'],
+    function (utils, opcodesAll, via, Acia, Serial, Tube, Adc, Econet, scheduler, TouchScreen) {
         "use strict";
         var hexword = utils.hexword;
         var signExtend = utils.signExtend;
@@ -576,8 +576,20 @@ define(['./utils', './6502.opcodes', './via', './acia', './serial', './tube', '.
                     case 0xfe14:
                         return this.serial.read(addr);
                     case 0xfe18:
+			if (!model.hasEconet) return;
                         if (model.isMaster) return this.adconverter.read(addr);
+			if (!model.isMaster) {
+				this.econet.disableNMI();
+				return this.econet.getStationNum();
+			}
                         break;
+		    case 0xfe20:
+			if (!model.hasEconet) return;
+			if (!model.isMaster && !this.econet.isNMIEnabled()) {
+				this.econet.enableNMI();
+				this.econet.delayedNMIAssert();
+			}
+			break;
                     case 0xfe24:
                     case 0xfe28:
                         if (model.isMaster) return this.fdc.read(addr);
@@ -585,6 +597,20 @@ define(['./utils', './6502.opcodes', './via', './acia', './serial', './tube', '.
                     case 0xfe34:
                         if (model.isMaster) return this.acccon;
                         break;
+		    case 0xfe3c:
+			if (!model.hasEconet) return;
+			if (model.isMaster && !this.econet.isNMIEnabled()) {
+				this.econet.enableNMI();
+				this.econet.delayedNMIAssert();
+			}
+			break;
+		    case 0xfe83:
+			if (!model.hasEconet) return;
+			if (model.isMaster){
+				this.econet.disableNMI();
+				return this.econet.getStationNum();
+			}
+			break;
                     case 0xfe40:
                     case 0xfe44:
                     case 0xfe48:
@@ -611,10 +637,15 @@ define(['./utils', './6502.opcodes', './via', './acia', './serial', './tube', '.
                     case 0xfe94:
                     case 0xfe98:
                     case 0xfe9c:
-                        if (!model.isMaster)
+                        if (!model.isaster)
                             return this.fdc.read(addr);
                         break;
-                    case 0xfec0:
+                    case 0xfea0:
+			if (model.hasEconet)
+			     return this.econet.read(addr);
+			return 0xfe;
+                        break;
+		    case 0xfec0:
                     case 0xfec4:
                     case 0xfec8:
                     case 0xfecc:
@@ -762,6 +793,11 @@ define(['./utils', './6502.opcodes', './via', './acia', './serial', './tube', '.
                         if (!model.isMaster)
                             return this.fdc.write(addr, b);
                         break;
+                    case 0xfea0:
+			if (model.hasEconet)
+			     return this.econet.write(addr, b);
+                        break;
+                    case 0xfec0:
                     case 0xfec0:
                     case 0xfec4:
                     case 0xfec8:
@@ -871,6 +907,7 @@ define(['./utils', './6502.opcodes', './via', './acia', './serial', './tube', '.
                     this.crtc = this.video.crtc;
                     this.ula = this.video.ula;
                     this.adconverter = new Adc(this.sysvia, this.scheduler);
+		    this.econet = new Econet(this, this.cmos);
                     this.sysvia.reset(hard);
                     this.uservia.reset(hard);
                 }
@@ -921,6 +958,7 @@ define(['./utils', './6502.opcodes', './via', './acia', './serial', './tube', '.
                 this.sysvia.polltime(cycles);
                 this.uservia.polltime(cycles);
                 this.scheduler.polltime(cycles);
+		this.econet.polltime(cycles);
                 this.tube.execute(cycles);
             };
 
@@ -932,6 +970,7 @@ define(['./utils', './6502.opcodes', './via', './acia', './serial', './tube', '.
                 this.sysvia.polltime(cycles);
                 this.uservia.polltime(cycles);
                 this.scheduler.polltime(cycles);
+		this.econet.polltime(cycles);
                 this.tube.execute(cycles);
             };
 
