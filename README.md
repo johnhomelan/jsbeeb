@@ -1,5 +1,8 @@
-[![Build Status](https://travis-ci.org/mattgodbolt/jsbeeb.svg?branch=master)](https://travis-ci.org/mattgodbolt/jsbeeb)
-[![Codewake](https://www.codewake.com/badges/ask_question_flat_square.svg)](https://www.codewake.com/p/jsbeeb)
+Notes on this fork
+------------------
+
+This version has been forked from Matthew Godbolt's original with the aim of introducing support for Econet emulation over a websocket.  Once its fully working I intend to contact Matthew about intergrating the changes back in however there is a fair bit of work needed before that.
+
 
 jsbeeb - Javascript BBC Micro emulator
 --------------------------------------
