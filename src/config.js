@@ -28,14 +28,17 @@ export const CheckboxSettings = [
     { id: "65c02", field: "coProcessor", restartRequired: true, enables: "tubeCpuMultiplier" },
     { id: "hasTeletextAdaptor", field: "hasTeletextAdaptor", restartRequired: true },
     { id: "hasEconet", field: "hasEconet", restartRequired: true },
+    { id: "econetRemote", field: "econetRemote", restartRequired: true },
     { id: "hasMusic5000", field: "hasMusic5000", restartRequired: true },
     { id: "mouseJoystickEnabled", field: "mouseJoystickEnabled" },
     { id: "speechOutput", field: "speechOutput" },
 ];
 
-/** The model is not a checkbox, but changing it needs a restart just the same. */
+/** The model is not a checkbox, but changing it needs a restart just the same, as do the Econet text fields. */
 const RestartRequiredFields = [
     "model",
+    "econetWsUrl",
+    "stationId",
     ...CheckboxSettings.filter((setting) => setting.restartRequired).map((setting) => setting.field),
 ];
 
@@ -64,6 +67,8 @@ export class Config extends EventTarget {
         this.changed = {};
         this.model = null;
         for (const { field } of CheckboxSettings) this[field] = false;
+        this.econetWsUrl = "ws://localhost:8090";
+        this.stationId = undefined;
         this.runningSettings = null;
         const configuration = document.getElementById("configuration");
         configuration.addEventListener("show.bs.modal", () => {
@@ -73,6 +78,8 @@ export class Config extends EventTarget {
             if (!this.runningSettings) this.runningSettings = this.proposedSettings();
             this.setDropdownText(this.model.name);
             this.setTubeCpuMultiplier(this.tubeCpuMultiplier);
+            this.setEconetWsUrl(this.econetWsUrl);
+            this.setStationId(this.stationId);
             this.setCheckboxes(this);
             this.showRestartPending();
         });
@@ -124,6 +131,15 @@ export class Config extends EventTarget {
             const val = parseFloat(document.getElementById("tubeCpuMultiplier").value);
             this.showTubeCpuMultiplier(val);
             this.changed.tubeCpuMultiplier = val;
+        });
+
+        document.getElementById("econetWsUrl").addEventListener("input", () => {
+            this.changed.econetWsUrl = document.getElementById("econetWsUrl").value;
+        });
+
+        document.getElementById("stationId").addEventListener("input", () => {
+            const raw = document.getElementById("stationId").value.trim();
+            this.changed.stationId = raw === "" ? undefined : parseInt(raw, 10);
         });
 
         for (const link of document.querySelectorAll(".keyboard-menu a")) {
@@ -202,6 +218,17 @@ export class Config extends EventTarget {
         this.tubeCpuMultiplier = value;
         document.getElementById("tubeCpuMultiplier").value = value;
         this.showTubeCpuMultiplier(value);
+    }
+
+    setEconetWsUrl(value) {
+        this.econetWsUrl = value;
+        document.getElementById("econetWsUrl").value = value;
+    }
+
+    /** @param {number|undefined} value a fixed station ID, or undefined for dynamic allocation over a remote transport */
+    setStationId(value) {
+        this.stationId = value;
+        document.getElementById("stationId").value = value ?? "";
     }
 
     showTubeCpuMultiplier(value, model = this.model) {

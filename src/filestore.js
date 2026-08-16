@@ -3,13 +3,12 @@
 
 "use strict";
 
-import { ReceiveBlock, EconetPacket } from "./econet.js";
 import * as utils from "./utils.js";
 
 export class Filestore {
-    constructor(cpu, econet) {
+    constructor(cpu, link) {
         this.cpu = cpu;
-        this.econet = econet;
+        this.link = link;
         this.scsi = [];
         this.l3fs = [];
         this.pollCount = 0;
@@ -115,14 +114,11 @@ export class Filestore {
 
                     if (bufstart >= 0x10000) bufstart = (bufstart & 0xffff) | 0x10000;
 
-                    this.econet.serverTx = new EconetPacket(stationId, 0, 254, 0);
-                    this.econet.serverTx.controlFlag = this.ram[p];
-                    this.econet.serverTx.port = this.ram[p + 1];
-
-                    for (let i = 0; i < length; i++) {
-                        this.econet.serverTx.buffer[i + 4] = this.ram[bufstart + i];
-                    }
-                    this.econet.serverTx.bytesInBuffer = 4 + length;
+                    this.link.transmitToStation(
+                        this.ram[p],
+                        this.ram[p + 1],
+                        this.ram.slice(bufstart, bufstart + length),
+                    );
                 }
                 break;
             }
@@ -131,8 +127,7 @@ export class Filestore {
                 // Receive
                 if (this.ram[p + 0] === 0) {
                     // Create new receive block
-                    let rxBuffer = new ReceiveBlock(
-                        this.econet.nextReceiveBlockNumber,
+                    this.ram[p] = this.link.openReceiveBlock(
                         this.ram[p + 1],
                         this.ram[p + 2],
                         (this.ram[p + 5] |
@@ -146,19 +141,9 @@ export class Filestore {
                             (this.ram[p + 12] << 24)) >>>
                             0,
                     );
-
-                    this.econet.receiveBlocks.push(rxBuffer);
-                    this.ram[p] = this.econet.nextReceiveBlockNumber;
-                    this.econet.nextReceiveBlockNumber++;
-                    this.econet.nextReceiveBlockNumber &= 0xff;
-                    if (this.econet.nextReceiveBlockNumber === 0) {
-                        this.econet.nextReceiveBlockNumber = 1;
-                    }
-
-                    //console.log("Filestore: new receive block " + rxBuffer.id + " " + rxBuffer.receivePort.toString(16) + " " + rxBuffer.bufferStart.toString(16) + " " + rxBuffer.bufferEnd.toString(16));
                 } // Read and delete receive block
                 else {
-                    let rxblock = this.econet.receiveBlocks.find((e) => e.id === this.ram[p + 0]);
+                    let rxblock = this.link.findReceiveBlock(this.ram[p + 0]);
                     if (rxblock.bufferStart + rxblock.data.bytesInBuffer - 4 < rxblock.bufferEnd) {
                         rxblock.bufferEnd = rxblock.bufferStart + rxblock.data.bytesInBuffer - 4;
                     }
@@ -183,7 +168,7 @@ export class Filestore {
                         this.ram[bufferStart + i] = rxblock.data.buffer[i + 4];
                     }
 
-                    this.econet.deleteReceiveBlock(this.ram[p]);
+                    this.link.deleteReceiveBlock(this.ram[p]);
                     //console.log("Filestore: read and delete receive block " + this.ram[p]);
                 }
                 break;
@@ -256,7 +241,7 @@ export class Filestore {
                 break;
 
             case 0x32: // Poll transmit block
-                if (this.econet.serverTx.bytesInBuffer > 0) {
+                if (this.link.hasPendingTransmit()) {
                     this.X = 0x80;
                 } else {
                     this.X = 0;
@@ -265,7 +250,7 @@ export class Filestore {
 
             case 0x33: {
                 // Poll receive block
-                let rxblock = this.econet.receiveBlocks.find((e) => e.id === this.X);
+                let rxblock = this.link.findReceiveBlock(this.X);
                 this.X = 0;
                 if (rxblock) {
                     this.X = rxblock.controlFlag;
@@ -279,7 +264,7 @@ export class Filestore {
             }
 
             case 0x34:
-                this.econet.deleteReceiveBlock(this.X);
+                this.link.deleteReceiveBlock(this.X);
                 break;
             case 0x35:
                 break;

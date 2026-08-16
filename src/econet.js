@@ -59,11 +59,22 @@ export class ReceiveBlock {
 }
 
 // Econet class definition
+//
+// This models the station's own ADLC (register/FIFO/status/IRQ behaviour, see readRegister,
+// writeRegister, updateRegisters, status, checkForNMI) plus the Econet four-way handshake that
+// turns bytes flowing through the ADLC's FIFOs into whole frames. The handshake talks to whatever
+// `transport` is plugged in via setTransport() rather than to any specific remote party, so the
+// same station logic drives both the in-browser fake file server (LocalFilestoreLink) and a real
+// remote station reached over AunWebSocketTransport.
+//
+// Frame addressing throughout mirrors the real Econet wire format: an EconetPacket's buffer
+// starts with four routing bytes, [DestStn][DestNet][SrcStn][SrcNet], before any payload — scouts
+// carry a control byte and port after that; data blocks repeat the same four routing bytes ahead
+// of the actual data (this is genuinely retransmitted per-frame on the wire, not padding).
 export class Econet {
     constructor(stationId_, cyclesPerSecond) {
         // Config parameters
         this.TIME_BETWEEN_BYTES = 128;
-        this.SERVER_STATION_ID = 254;
         this.retryCycles = (cyclesPerSecond * RetryTimeoutSecs) | 0;
 
         // 4-way handshake states
@@ -75,11 +86,19 @@ export class Econet {
 
         // Econet properties
         this.stationId = stationId_;
+        this.network = 0;
         this.ADLC = new ADLC();
         this.ADLCprev = new ADLC();
         this.beebTx = new EconetPacket();
         this.beebRx = new EconetPacket();
-        this.serverTx = new EconetPacket();
+
+        // The party at the other end of the wire. Null means nothing is plugged in: the ADLC
+        // idles exactly as real hardware would with no cable attached.
+        this.transport = null;
+
+        // Complete inbound frames (routing header + data) waiting to be walked through the
+        // scout/ack/body/ack handshake and delivered into beebRx. Pushed to by deliverInboundUnicast().
+        this.inboundQueue = [];
 
         this.pollTotalCycles = 0;
         this.pollNextTrigger = 0;
@@ -88,14 +107,54 @@ export class Econet {
         this.econetNMIEnabled = true;
         this.econetStateChanged = false;
 
-        this.receiveBlocks = [];
-        this.nextReceiveBlockNumber = 1;
-
         this.wireState = this.FWH_Idle;
         this.wireStateEntryTimer = 0;
         this.statusLight = false;
+
+        // Captured from the outbound scout while we wait for the body (FWH_TX_Scout_Sent).
+        this.txDestStn = 0;
+        this.txDestNet = 0;
         this.txPort = 0;
         this.txControlFlag = 0;
+    }
+
+    /** Plugs in (or unplugs, with `null`) the party at the other end of the wire. */
+    setTransport(transport) {
+        this.transport = transport;
+    }
+
+    /** Applies a station/network address, e.g. once a remote transport's dynamic allocation completes. */
+    setAddress(stationId, network = 0) {
+        this.stationId = stationId;
+        this.network = network;
+    }
+
+    /**
+     * Called by a transport when a whole Unicast frame has arrived from the network, addressed to
+     * this station. Queued rather than delivered immediately: the handshake still has to walk the
+     * Beeb through scout -> scout-ack -> body -> body-ack exactly as it would for a real frame
+     * arriving over the wire.
+     */
+    deliverInboundUnicast(srcStn, srcNet, controlByte, port, data) {
+        const pkt = new EconetPacket(this.stationId, this.network, srcStn, srcNet);
+        pkt.buffer.set(data, 4);
+        pkt.bytesInBuffer = 4 + data.length;
+        pkt.controlFlag = controlByte;
+        pkt.port = port;
+        this.inboundQueue.push(pkt);
+        this.econetStateChanged = true;
+    }
+
+    /**
+     * Called by a transport once the far end has accepted an outbound body (transport.sendUnicast's
+     * callback). Guarded against late/duplicate calls: if the handshake has already moved on (e.g.
+     * the retry timeout in polltime() gave up and synthesised a fallback ack), this is a no-op.
+     */
+    transportAcked() {
+        if (this.wireState !== this.FWH_TX_Scout_Sent) return;
+        this.beebRx = new EconetPacket(this.stationId, this.network, this.txDestStn, this.txDestNet);
+        this.advanceState(this.FWH_Idle);
+        this.econetStateChanged = true;
     }
 
     copyBuffer(destination, source) {
@@ -117,13 +176,6 @@ export class Econet {
         return outputString;
     }
 
-    deleteReceiveBlock(id) {
-        let pos = this.receiveBlocks.findIndex((e) => e.id === id);
-        if (pos >= 0) {
-            this.receiveBlocks.splice(pos, 1);
-        }
-    }
-
     activityLight() {
         return this.statusLight;
     }
@@ -142,45 +194,65 @@ export class Econet {
         if (this.pollNextTrigger <= this.pollTotalCycles || this.econetStateChanged) {
             this.econetStateChanged = false;
 
-            if (this.wireState === this.FWH_Idle && this.serverTx.bytesInBuffer > 0) {
+            if (this.wireState === this.FWH_Idle && this.inboundQueue.length > 0) {
+                const pending = this.inboundQueue[0];
                 this.beebRx = new EconetPacket(
                     this.stationId,
-                    0,
-                    this.SERVER_STATION_ID,
-                    0,
-                    this.serverTx.controlFlag,
-                    this.serverTx.port,
+                    this.network,
+                    pending.buffer[2],
+                    pending.buffer[3],
+                    pending.controlFlag,
+                    pending.port,
                 );
                 this.advanceState(this.FWH_RX_Scout_Received); // 1 - RX Received scout - waiting for ack sent
             }
 
             if (this.wireState === this.FWH_RX_ScoutAck_Received) {
-                this.copyBuffer(this.beebRx, this.serverTx);
+                this.copyBuffer(this.beebRx, this.inboundQueue[0]);
                 this.advanceState(this.FWH_RX_Body_Received); // 3 - RX Body received - waiting for final ack
             }
 
             // Re-tries
             if (this.pollTotalCycles > this.wireStateEntryTimer + this.retryCycles) {
                 if (this.wireState !== this.FWH_Idle) {
+                    const pending = this.inboundQueue[0];
                     switch (this.wireState) {
                         case this.FWH_RX_Scout_Received:
                             // No ack was sent and we were expecting one, send the scout again
                             this.beebRx = new EconetPacket(
                                 this.stationId,
-                                0,
-                                this.SERVER_STATION_ID,
-                                0,
-                                this.serverTx.controlFlag,
-                                this.serverTx.port,
+                                this.network,
+                                pending.buffer[2],
+                                pending.buffer[3],
+                                pending.controlFlag,
+                                pending.port,
                             );
                             this.advanceState(this.FWH_RX_Scout_Received); // reset timer
                             break;
                         case this.FWH_RX_Body_Received:
-                            this.copyBuffer(this.beebRx, this.serverTx);
+                            this.copyBuffer(this.beebRx, pending);
                             this.advanceState(this.FWH_RX_Body_Received); // reset timer
                             break;
-                        default:
-                            this.beebRx = new EconetPacket(this.SERVER_STATION_ID, 0, this.stationId, 0); // Send an ack?
+                        case this.FWH_RX_ScoutAck_Received:
+                            // The Beeb never sent its scout-ack in time; fall back to a bare ack so
+                            // the handshake can make forward progress.
+                            this.beebRx = new EconetPacket(
+                                this.stationId,
+                                this.network,
+                                pending.buffer[2],
+                                pending.buffer[3],
+                            );
+                            break;
+                        case this.FWH_TX_Scout_Sent:
+                            // The transport never confirmed our outbound body; fall back to a bare
+                            // ack rather than stalling forever.
+                            this.beebRx = new EconetPacket(
+                                this.stationId,
+                                this.network,
+                                this.txDestStn,
+                                this.txDestNet,
+                            );
+                            break;
                     }
                 } else {
                     this.statusLight = false;
@@ -230,9 +302,8 @@ export class Econet {
         this.pollNextTrigger = this.pollTotalCycles + this.TIME_BETWEEN_BYTES;
         this.econetStateChanged = true;
 
-        // Reset any open receive blocks
-        this.receiveBlocks = [];
-        this.nextReceiveBlockNumber = 1;
+        this.inboundQueue = [];
+        this.wireState = this.FWH_Idle;
     }
 
     readRegister(register) {
@@ -395,20 +466,31 @@ export class Econet {
                             this.sniffBuffer(this.beebTx)
                     );*/
 
-                    // Is this an immediate operation ? Assume it is a machine peek
+                    // Is this an immediate operation ? Assume it is a machine peek. This is answered
+                    // directly rather than routed through the transport: it is a hardware-level peek
+                    // of whichever station was addressed, not a file-server-level exchange.
                     if (
                         this.beebTx.bytesInBuffer === 10 &&
                         this.beebTx.buffer[5] === 0 &&
                         this.beebTx.buffer[4] >= 0x82 &&
                         this.beebTx.buffer[4] <= 0x88
                     ) {
-                        this.beebRx = new EconetPacket(this.stationId, 0, this.SERVER_STATION_ID, 0, 1, 0, 0x60, 0x03);
+                        this.beebRx = new EconetPacket(
+                            this.stationId,
+                            this.network,
+                            this.beebTx.buffer[0],
+                            this.beebTx.buffer[1],
+                            1,
+                            0,
+                            0x60,
+                            0x03,
+                        );
                     }
 
                     // Is this an ack?
                     if (this.beebTx.bytesInBuffer === 4) {
                         // if state = 1, move to state 2
-                        //if state = 3, clear FileStoreTX and move to state 0
+                        //if state = 3, clear the pending inbound frame and move to state 0
 
                         if (this.wireState === this.FWH_RX_Scout_Received) {
                             // 1 - RX Received scout - waiting for ack sent
@@ -417,39 +499,55 @@ export class Econet {
 
                         if (this.wireState === this.FWH_RX_Body_Received) {
                             // 3 - RX Body received - waiting for final ack
-                            this.serverTx.bytesInBuffer = 0;
+                            this.inboundQueue.shift();
                             this.advanceState(this.FWH_Idle);
                         }
                     }
 
                     // Is this a body ?
                     if (this.beebTx.bytesInBuffer >= 6 && this.wireState === this.FWH_TX_Scout_Sent) {
-                        // if at state 4, copy to server RX block, drop ack into BeebRX and move to state 0
-                        let serverReceiveBlock = this.receiveBlocks.find(
-                            (element) => element.receivePort === this.txPort,
-                        );
-                        if (serverReceiveBlock) {
-                            this.copyBuffer(serverReceiveBlock.data, this.beebTx);
-                            serverReceiveBlock.stationId = this.stationId;
-                            serverReceiveBlock.controlFlag = this.txControlFlag;
+                        // if at state 4, hand the body to the transport; the transport's callback
+                        // (or, for a synchronous local transport, this call itself) drives us on to
+                        // state 0 via transportAcked()
+                        const data = this.beebTx.buffer.slice(4, this.beebTx.bytesInBuffer);
+                        if (this.transport) {
+                            this.transport.sendUnicast(
+                                this.txDestStn,
+                                this.txDestNet,
+                                this.stationId,
+                                this.network,
+                                this.txControlFlag,
+                                this.txPort,
+                                data,
+                                () => this.transportAcked(),
+                            );
+                        } else {
+                            this.transportAcked();
                         }
-                        this.beebRx = new EconetPacket(this.stationId, 0, this.SERVER_STATION_ID, 0);
-                        this.advanceState(this.FWH_Idle);
                     }
 
                     // Is this a scout ?
                     if (this.beebTx.bytesInBuffer === 6) {
-                        //if state = 0, remember port and control byte
-                        // move to state 4 if there is a server RX block set up and drop ack into BeebRX,
-                        // otherwise ignore
+                        //if state = 0, remember destination/port/control byte
+                        // move to state 4 (and ack the scout) if the transport will accept it,
+                        // otherwise ignore (matches a real station that isn't listening: silence)
 
                         if (this.wireState === this.FWH_Idle) {
+                            this.txDestStn = this.beebTx.buffer[0];
+                            this.txDestNet = this.beebTx.buffer[1];
                             this.txControlFlag = this.beebTx.buffer[4];
                             this.txPort = this.beebTx.buffer[5];
 
-                            // Send an ack if the server has a port open for this
-                            if (this.receiveBlocks.find((element) => element.receivePort === this.txPort)) {
-                                this.beebRx = new EconetPacket(this.stationId, 0, this.SERVER_STATION_ID, 0);
+                            if (
+                                this.transport &&
+                                this.transport.canAcceptScout(this.txDestStn, this.txDestNet, this.txPort)
+                            ) {
+                                this.beebRx = new EconetPacket(
+                                    this.stationId,
+                                    this.network,
+                                    this.txDestStn,
+                                    this.txDestNet,
+                                );
                                 this.advanceState(this.FWH_TX_Scout_Sent); //  4 - TX Scout sent - waiting for ack
                             }
                         }

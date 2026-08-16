@@ -9,6 +9,7 @@ import { Scheduler } from "./scheduler.js";
 import { TouchScreen } from "./touchscreen.js";
 import { TeletextAdaptor } from "./teletext_adaptor.js";
 import { Filestore } from "./filestore.js";
+import { LocalFilestoreLink } from "./local_filestore_link.js";
 import { FakeRelayNoise } from "./relaynoise.js";
 import { AtomPPIA } from "./ppia.js";
 import { AtomMMC2 } from "./mmc.js";
@@ -1379,7 +1380,13 @@ export class Cpu6502 extends Base6502 {
         this.adconverter.reset();
 
         this.touchScreen.reset();
-        if (this.econet) this.filestore = new Filestore(this, this.econet);
+        if (this.econet) {
+            // No transport plugged in from outside (e.g. by main.js for a remote WebSocket
+            // session): default to the built-in, zero-setup fake file server.
+            if (!this.econet.transport) this.econet.setTransport(new LocalFilestoreLink(this.econet));
+            if (this.econet.transport instanceof LocalFilestoreLink)
+                this.filestore = new Filestore(this, this.econet.transport);
+        }
     }
 
     // Universal CPU state reset. Shared by all machine types.
@@ -1404,7 +1411,8 @@ export class Cpu6502 extends Base6502 {
         if (this.music5000) this.music5000.reset(hard);
         if (hard && this.econet) {
             this.econet.reset();
-            this.filestore.reset();
+            this.econet.transport?.reset();
+            this.filestore?.reset();
         }
     }
 
@@ -1447,7 +1455,7 @@ export class Cpu6502 extends Base6502 {
                   if (donmi && this.econet.econetNMIEnabled) {
                       this.NMI(true);
                   }
-                  this.filestore.polltime(cycles);
+                  this.filestore?.polltime(cycles);
               }
             : nop;
 

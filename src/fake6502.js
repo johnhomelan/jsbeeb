@@ -28,6 +28,7 @@ export function fake6502(model, opts) {
         relayNoise: new FakeRelayNoise(),
         music5000: new FakeMusic5000(),
         cmos: new Cmos(),
+        econet: opts.econet,
         cycleAccurate: opts.cycleAccurate,
         config: {
             tube: opts.tube ? tubeModelFor(model) : null,

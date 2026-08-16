@@ -660,6 +660,7 @@
             <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
           </div>
           <div class="modal-body">
+            <div id="econet-status" class="mb-2"></div>
             <label>
               Download server drive image (10mb scsi.dat):<br />
 
@@ -1026,6 +1027,38 @@
                   <div class="form-check">
                     <input class="form-check-input" type="checkbox" id="hasEconet" name="hasEconet" />
                     <label class="form-check-label" for="hasEconet">Econet with file server</label>
+                  </div>
+                  <div class="ms-4">
+                    <div class="form-check">
+                      <input class="form-check-input" type="checkbox" id="econetRemote" name="econetRemote" />
+                      <label class="form-check-label" for="econetRemote">
+                        Use a remote Econet server (WebSocket) instead of the built-in file server
+                      </label>
+                    </div>
+                    <div class="row align-items-center mt-1">
+                      <div class="col-sm-5">
+                        <label for="econetWsUrl" class="col-form-label">Server URL:</label>
+                      </div>
+                      <div class="col-sm-7">
+                        <input
+                          type="text"
+                          class="form-control form-control-sm"
+                          id="econetWsUrl"
+                          placeholder="ws://localhost:8090"
+                        />
+                      </div>
+                    </div>
+                    <div class="row align-items-center mt-1">
+                      <div class="col-sm-5">
+                        <label for="stationId" class="col-form-label">Station ID (blank = auto-assign):</label>
+                      </div>
+                      <div class="col-sm-7">
+                        <input type="text" class="form-control form-control-sm" id="stationId" placeholder="auto" />
+                      </div>
+                    </div>
+                    <div class="form-text">
+                      Remote mode requires an aun-filestore server with the base64 WebSocket payload fix.
+                    </div>
                   </div>
                 </div>
               </div>

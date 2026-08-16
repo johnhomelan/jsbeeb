@@ -24,6 +24,7 @@ import { DefaultModel, findModel, tubeModelFor } from "./models.js";
 import { initialise as electron } from "./app/electron.js";
 import { AudioHandler } from "./web/audio-handler.js";
 import { Econet } from "./econet.js";
+import { AunWebSocketTransport } from "./aun_websocket.js";
 import { DiscLayout, toSsdOrDsd } from "./disc.js";
 import { toHfe } from "./disc-hfe.js";
 import { Keyboard } from "./keyboard.js";
@@ -130,6 +131,7 @@ const paramTypes = {
     hasMusic5000: ParamTypes.BOOL,
     hasTeletextAdaptor: ParamTypes.BOOL,
     hasEconet: ParamTypes.BOOL,
+    econetRemote: ParamTypes.BOOL,
     glEnabled: ParamTypes.BOOL,
     fakeVideo: ParamTypes.BOOL,
     logFdcCommands: ParamTypes.BOOL,
@@ -157,6 +159,7 @@ const paramTypes = {
     tape: ParamTypes.STRING,
     mmc: ParamTypes.STRING,
     keyLayout: ParamTypes.STRING,
+    econetWsUrl: ParamTypes.STRING,
     autotype: ParamTypes.STRING,
     displayMode: ParamTypes.STRING,
     drive0Tracks: ParamTypes.STRING,
@@ -177,6 +180,8 @@ let noSeek;
 let audioFilterFreq = 7000;
 let audioFilterQ = 5;
 let stationId = 101;
+const stationIdExplicit = parsedQuery.stationId !== undefined;
+let econetWsUrl = "ws://localhost:8090";
 let econet = null;
 
 // Parse disc and tape images from query parameters
@@ -207,6 +212,7 @@ noSeek = !!parsedQuery.noseek;
 if (parsedQuery.audiofilterfreq !== undefined) audioFilterFreq = parsedQuery.audiofilterfreq;
 if (parsedQuery.audiofilterq !== undefined) audioFilterQ = parsedQuery.audiofilterq;
 if (parsedQuery.stationId !== undefined) stationId = parsedQuery.stationId;
+if (parsedQuery.econetWsUrl !== undefined) econetWsUrl = parsedQuery.econetWsUrl;
 if (parsedQuery.frameSkip !== undefined) frameSkip = parsedQuery.frameSkip;
 
 const printer = new Printer({
@@ -297,6 +303,8 @@ if (!requestedModel)
 config.setModel((requestedModel ?? DefaultModel).name);
 config.setKeyLayout(keyLayout);
 config.setTubeCpuMultiplier(parsedQuery.tubeCpuMultiplier || 1);
+config.setEconetWsUrl(econetWsUrl);
+config.setStationId(stationIdExplicit ? stationId : undefined);
 config.setMicrophoneChannel(parsedQuery.microphoneChannel);
 config.setCheckboxes({
     coProcessor: !!parsedQuery.coProcessor,
@@ -634,6 +642,13 @@ async function loadHTMLFile(file) {
 }
 
 async function loadSCSIFile(file) {
+    if (!processor.filestore) {
+        toast("A custom drive image can only be loaded for the built-in (local) Econet file server.", {
+            title: "Econet",
+        });
+        return;
+    }
+
     const binaryData = await readFileAsBinaryString(file);
     processor.filestore.scsi = utils.stringToUint8Array(binaryData);
 
@@ -643,8 +658,7 @@ async function loadSCSIFile(file) {
     processor.filestore.emulationSpeed = 0;
 
     // Reset any open receive blocks
-    processor.econet.receiveBlocks = [];
-    processor.econet.nextReceiveBlockNumber = 1;
+    processor.econet.transport.reset();
 
     $fsModal.hide();
 }
@@ -760,6 +774,17 @@ window.addEventListener("beforeunload", function (event) {
 
 if (config.hasEconet) {
     econet = new Econet(stationId, model.cyclesPerSecond);
+    if (config.econetRemote) {
+        const transport = new AunWebSocketTransport(econetWsUrl, {
+            station: stationIdExplicit ? stationId : null,
+            onStatusChange: (status) => {
+                const el = document.getElementById("econet-status");
+                if (el) el.textContent = `Econet (${econetWsUrl}): ${status}`;
+            },
+        });
+        econet.setTransport(transport);
+        transport.connect(econet);
+    }
 } else {
     document.getElementById("fsmenuitem").style.display = "none";
 }
@@ -1826,6 +1851,12 @@ document.getElementById("download-drive-hfe-link").addEventListener("click", fun
 });
 
 document.getElementById("download-filestore-link").addEventListener("click", function () {
+    if (!processor.filestore) {
+        toast("A drive image can only be downloaded from the built-in (local) Econet file server.", {
+            title: "Econet",
+        });
+        return;
+    }
     downloadDriveData(processor.filestore.scsi, "scsi", ".dat");
 });
 
