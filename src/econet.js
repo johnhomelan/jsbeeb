@@ -3,6 +3,9 @@
 
 // How long a four-way handshake may stall before we resend.
 const RetryTimeoutSecs = 0.5;
+// How long the line stays in flag fill after we hand a frame to the transport, covering the far
+// end's real network round trip. Matches BeebEm's DEFAULT_FLAG_FILL_TIMEOUT (250ms at 2MHz).
+const FlagFillTimeoutCycles = 500000;
 
 // Econet support classes
 class ADLC {
@@ -91,6 +94,8 @@ export class Econet {
         this.ADLCprev = new ADLC();
         this.beebTx = new EconetPacket();
         this.beebRx = new EconetPacket();
+        // An inbound frame waiting for the Beeb to release RxReset; see presentFrame().
+        this.pendingRx = null;
 
         // The party at the other end of the wire. Null means nothing is plugged in: the ADLC
         // idles exactly as real hardware would with no cable attached.
@@ -106,10 +111,18 @@ export class Econet {
 
         this.econetNMIEnabled = true;
         this.econetStateChanged = false;
+        this.lastNmiControl1 = 0;
 
         this.wireState = this.FWH_Idle;
         this.wireStateEntryTimer = 0;
         this.statusLight = false;
+
+        // While a frame is in flight to the far end, the line is held in flag fill: the ADLC sees
+        // flags (status1 FD) rather than an idle line (status2 RxIdle), which is what keeps the
+        // NFS ROM waiting for the reply instead of concluding nobody answered. Cleared when the
+        // reply arrives or after FlagFillTimeoutCycles.
+        this.flagFillActive = false;
+        this.flagFillTimeoutAt = 0;
 
         // Captured from the outbound scout while we wait for the body (FWH_TX_Scout_Sent).
         this.txDestStn = 0;
@@ -146,15 +159,57 @@ export class Econet {
     }
 
     /**
+     * Called by a transport for a direct reply to one of our own broadcasts (e.g. a bridge
+     * discovery reply) or immediate operation. These are 2-way exchanges: the reply frame on the
+     * wire is just the 4 routing bytes followed by the payload, with no control or port bytes
+     * (the requester knows what it asked). The local "machine peek" reply in transmit() has the
+     * same shape: its 1, 0, 0x60, 0x03 tail is machine type 0x0001 + NFS version 3.60, all
+     * payload, not control/port bytes.
+     */
+    deliverInboundImmediateReply(srcStn, srcNet, data) {
+        this.presentFrame(new EconetPacket(this.stationId, 0, srcStn, srcNet, ...data));
+        this.flagFillActive = false;
+    }
+
+    /** The far end is dealing with a frame we just sent it; hold the line in flag fill meanwhile. */
+    setFlagFill() {
+        this.flagFillActive = true;
+        this.flagFillTimeoutAt = this.pollTotalCycles + FlagFillTimeoutCycles;
+    }
+
+    /**
+     * Puts an inbound frame on the Beeb's doorstep. While the Beeb holds its receiver in reset
+     * (as it does throughout its own transmissions), the frame waits in pendingRx rather than
+     * going straight into beebRx, where updateRegisters() would wipe it before the Beeb ever saw
+     * it; polltime() moves it across once RxReset is released. On real hardware this gap doesn't
+     * exist: the far end's reply only starts arriving after a turnaround delay, by which time the
+     * receiver is listening again.
+     *
+     * The destination network byte is forced to 0: traffic on the local wire always addresses the
+     * local network as 0, and the NFS ROM enforces this on every frame it receives (its receive
+     * routines abort unless this byte is 0, or 0xFF for a broadcast). `this.network` is the AUN
+     * transport's routing-layer network number, which never appears in this byte on a real wire.
+     */
+    presentFrame(packet) {
+        packet.buffer[1] = 0;
+        if (this.ADLC.control1 & 64) {
+            this.pendingRx = packet;
+        } else {
+            this.beebRx = packet;
+        }
+        this.econetStateChanged = true;
+    }
+
+    /**
      * Called by a transport once the far end has accepted an outbound body (transport.sendUnicast's
      * callback). Guarded against late/duplicate calls: if the handshake has already moved on (e.g.
      * the retry timeout in polltime() gave up and synthesised a fallback ack), this is a no-op.
      */
     transportAcked() {
         if (this.wireState !== this.FWH_TX_Scout_Sent) return;
-        this.beebRx = new EconetPacket(this.stationId, this.network, this.txDestStn, this.txDestNet);
+        this.presentFrame(new EconetPacket(this.stationId, this.network, this.txDestStn, this.txDestNet));
+        this.flagFillActive = false;
         this.advanceState(this.FWH_Idle);
-        this.econetStateChanged = true;
     }
 
     copyBuffer(destination, source) {
@@ -191,24 +246,42 @@ export class Econet {
     polltime(cycles) {
         this.pollTotalCycles += cycles;
 
+        if (this.flagFillActive && this.pollTotalCycles >= this.flagFillTimeoutAt) {
+            this.flagFillActive = false;
+        }
+
         if (this.pollNextTrigger <= this.pollTotalCycles || this.econetStateChanged) {
             this.econetStateChanged = false;
 
-            if (this.wireState === this.FWH_Idle && this.inboundQueue.length > 0) {
+            if (this.pendingRx && !(this.ADLC.control1 & 64)) {
+                this.beebRx = this.pendingRx;
+                this.pendingRx = null;
+            }
+
+            // A queued frame waits not just for the wire to go idle but for the Beeb to finish
+            // reading whatever is already on its doorstep: a reply can arrive in the same poll
+            // window as the ack completing our own transmission, and starting the new scout then
+            // would overwrite that ack before the Beeb ever saw it.
+            const doorstepClear = !this.pendingRx && this.beebRx.bytesInBuffer === 0 && this.ADLC.rxfptr === 0;
+            if (this.wireState === this.FWH_Idle && this.inboundQueue.length > 0 && doorstepClear) {
                 const pending = this.inboundQueue[0];
-                this.beebRx = new EconetPacket(
-                    this.stationId,
-                    this.network,
-                    pending.buffer[2],
-                    pending.buffer[3],
-                    pending.controlFlag,
-                    pending.port,
+                this.presentFrame(
+                    new EconetPacket(
+                        this.stationId,
+                        this.network,
+                        pending.buffer[2],
+                        pending.buffer[3],
+                        pending.controlFlag,
+                        pending.port,
+                    ),
                 );
                 this.advanceState(this.FWH_RX_Scout_Received); // 1 - RX Received scout - waiting for ack sent
             }
 
             if (this.wireState === this.FWH_RX_ScoutAck_Received) {
-                this.copyBuffer(this.beebRx, this.inboundQueue[0]);
+                const body = new EconetPacket();
+                this.copyBuffer(body, this.inboundQueue[0]);
+                this.presentFrame(body);
                 this.advanceState(this.FWH_RX_Body_Received); // 3 - RX Body received - waiting for final ack
             }
 
@@ -219,38 +292,37 @@ export class Econet {
                     switch (this.wireState) {
                         case this.FWH_RX_Scout_Received:
                             // No ack was sent and we were expecting one, send the scout again
-                            this.beebRx = new EconetPacket(
-                                this.stationId,
-                                this.network,
-                                pending.buffer[2],
-                                pending.buffer[3],
-                                pending.controlFlag,
-                                pending.port,
+                            this.presentFrame(
+                                new EconetPacket(
+                                    this.stationId,
+                                    this.network,
+                                    pending.buffer[2],
+                                    pending.buffer[3],
+                                    pending.controlFlag,
+                                    pending.port,
+                                ),
                             );
                             this.advanceState(this.FWH_RX_Scout_Received); // reset timer
                             break;
-                        case this.FWH_RX_Body_Received:
-                            this.copyBuffer(this.beebRx, pending);
+                        case this.FWH_RX_Body_Received: {
+                            const body = new EconetPacket();
+                            this.copyBuffer(body, pending);
+                            this.presentFrame(body);
                             this.advanceState(this.FWH_RX_Body_Received); // reset timer
                             break;
+                        }
                         case this.FWH_RX_ScoutAck_Received:
                             // The Beeb never sent its scout-ack in time; fall back to a bare ack so
                             // the handshake can make forward progress.
-                            this.beebRx = new EconetPacket(
-                                this.stationId,
-                                this.network,
-                                pending.buffer[2],
-                                pending.buffer[3],
+                            this.presentFrame(
+                                new EconetPacket(this.stationId, this.network, pending.buffer[2], pending.buffer[3]),
                             );
                             break;
                         case this.FWH_TX_Scout_Sent:
                             // The transport never confirmed our outbound body; fall back to a bare
                             // ack rather than stalling forever.
-                            this.beebRx = new EconetPacket(
-                                this.stationId,
-                                this.network,
-                                this.txDestStn,
-                                this.txDestNet,
+                            this.presentFrame(
+                                new EconetPacket(this.stationId, this.network, this.txDestStn, this.txDestNet),
                             );
                             break;
                     }
@@ -264,6 +336,7 @@ export class Econet {
                 this.transmit();
                 this.receive();
             }
+            this.updateIdle();
             this.status();
 
             return this.checkForNMI();
@@ -297,12 +370,14 @@ export class Econet {
 
         this.irqcause = 0;
         this.sr1b2cause = 0;
+        this.lastNmiControl1 = this.ADLC.control1;
 
         // Initialise the start trigger of the polling routine
         this.pollNextTrigger = this.pollTotalCycles + this.TIME_BETWEEN_BYTES;
         this.econetStateChanged = true;
 
         this.inboundQueue = [];
+        this.pendingRx = null;
         this.wireState = this.FWH_Idle;
     }
 
@@ -466,25 +541,64 @@ export class Econet {
                             this.sniffBuffer(this.beebTx)
                     );*/
 
-                    // Is this an immediate operation ? Assume it is a machine peek. This is answered
-                    // directly rather than routed through the transport: it is a hardware-level peek
-                    // of whichever station was addressed, not a file-server-level exchange.
+                    // Is this a broadcast? Unlike a scout, a broadcast has no ack/reply handshake on
+                    // the wire: the whole frame (addressed to the wildcard station/network FF.FF)
+                    // goes out as a single transmission, so it never fits the 4/6/10-byte shapes the
+                    // checks below look for and would otherwise just be silently discarded here.
+                    const isBroadcast = this.beebTx.buffer[0] === 0xff && this.beebTx.buffer[1] === 0xff;
+                    if (isBroadcast && this.beebTx.bytesInBuffer >= 6) {
+                        const data = this.beebTx.buffer.slice(6, this.beebTx.bytesInBuffer);
+                        if (this.transport?.sendBroadcast) {
+                            this.setFlagFill();
+                            this.transport.sendBroadcast(
+                                this.stationId,
+                                this.network,
+                                this.beebTx.buffer[4],
+                                this.beebTx.buffer[5],
+                                data,
+                            );
+                        }
+                    }
+
+                    // Is this an immediate operation ? Assume it is a machine peek: a hardware-level
+                    // peek of whichever station was addressed, not a file-server-level exchange. With
+                    // a real transport plugged in, the addressed station is a real remote machine, so
+                    // this has to go over the wire like any other frame; only without a transport (or
+                    // if the transport doesn't support immediate ops) do we fake a canned local reply,
+                    // since there's no real station to actually ask.
                     if (
+                        !isBroadcast &&
                         this.beebTx.bytesInBuffer === 10 &&
                         this.beebTx.buffer[5] === 0 &&
                         this.beebTx.buffer[4] >= 0x82 &&
                         this.beebTx.buffer[4] <= 0x88
                     ) {
-                        this.beebRx = new EconetPacket(
-                            this.stationId,
-                            this.network,
-                            this.beebTx.buffer[0],
-                            this.beebTx.buffer[1],
-                            1,
-                            0,
-                            0x60,
-                            0x03,
-                        );
+                        if (this.transport?.sendImmediate) {
+                            const data = this.beebTx.buffer.slice(6, this.beebTx.bytesInBuffer);
+                            this.setFlagFill();
+                            this.transport.sendImmediate(
+                                this.beebTx.buffer[0],
+                                this.beebTx.buffer[1],
+                                this.stationId,
+                                this.network,
+                                this.beebTx.buffer[4],
+                                this.beebTx.buffer[5],
+                                data,
+                            );
+                        } else {
+                            this.presentFrame(
+                                new EconetPacket(
+                                    this.stationId,
+                                    this.network,
+                                    this.beebTx.buffer[0],
+                                    this.beebTx.buffer[1],
+                                    1,
+                                    0,
+                                    0x60,
+                                    0x03,
+                                ),
+                            );
+                        }
                     }
 
                     // Is this an ack?
@@ -511,6 +625,9 @@ export class Econet {
                         // state 0 via transportAcked()
                         const data = this.beebTx.buffer.slice(4, this.beebTx.bytesInBuffer);
                         if (this.transport) {
+                            // Before the send: a synchronous transport acks (and so clears flag
+                            // fill again) inside this call.
+                            this.setFlagFill();
                             this.transport.sendUnicast(
                                 this.txDestStn,
                                 this.txDestNet,
@@ -527,7 +644,7 @@ export class Econet {
                     }
 
                     // Is this a scout ?
-                    if (this.beebTx.bytesInBuffer === 6) {
+                    if (!isBroadcast && this.beebTx.bytesInBuffer === 6) {
                         //if state = 0, remember destination/port/control byte
                         // move to state 4 (and ack the scout) if the transport will accept it,
                         // otherwise ignore (matches a real station that isn't listening: silence)
@@ -542,11 +659,8 @@ export class Econet {
                                 this.transport &&
                                 this.transport.canAcceptScout(this.txDestStn, this.txDestNet, this.txPort)
                             ) {
-                                this.beebRx = new EconetPacket(
-                                    this.stationId,
-                                    this.network,
-                                    this.txDestStn,
-                                    this.txDestNet,
+                                this.presentFrame(
+                                    new EconetPacket(this.stationId, this.network, this.txDestStn, this.txDestNet),
                                 );
                                 this.advanceState(this.FWH_TX_Scout_Sent); //  4 - TX Scout sent - waiting for ack
                             }
@@ -601,22 +715,21 @@ export class Econet {
             }
         }
 
-        // Update idle status
-        if (
-            !(this.ADLC.control1 & 0x40) && // not rxreset
-            !this.ADLC.rxfptr && // nothing in fifo
-            !(this.ADLC.status2 & 2) && // no FV
-            this.beebRx.bytesInBuffer === 0
-        ) {
-            // nothing in ip buffer
-            this.ADLC.idle = true;
-        } else {
-            this.ADLC.idle = false;
-        }
-
         //----------------------------------------------------------------------------------
         // how long before we come back in here?
         this.pollNextTrigger = this.pollTotalCycles + this.TIME_BETWEEN_BYTES;
+    }
+
+    // Recomputed on every polltime pass, not just the TIME_BETWEEN_BYTES-paced receive() ones:
+    // a frame delivered between receive() passes must stop the line reading as idle straight
+    // away, or the ROM sees a stale "Inactive Idle Received" and gives up on the reply it was
+    // waiting for.
+    updateIdle() {
+        this.ADLC.idle =
+            !(this.ADLC.control1 & 0x40) && // not rxreset
+            !this.ADLC.rxfptr && // nothing in fifo
+            !(this.ADLC.status2 & 2) && // no FV
+            this.beebRx.bytesInBuffer === 0; // nothing waiting to be shifted in
     }
 
     status() {
@@ -636,7 +749,13 @@ export class Econet {
             }
         }
 
-        this.ADLC.status1 &= ~8;
+        // SR1b3 - FD - Flag detected: the line carries flags, not idle, while the far end holds
+        // it in flag fill.
+        if (this.flagFillActive) {
+            this.ADLC.status1 |= 8;
+        } else {
+            this.ADLC.status1 &= ~8;
+        }
 
         if (this.ADLC.control2 & 128) {
             // clock + RTS
@@ -702,8 +821,7 @@ export class Econet {
                 this.ADLC.status2 |= 2;
             }
             // SR2b2 - Inactive Idle Received - sets irq!
-            if (this.ADLC.idle) {
-                // && !this.flagFillActive) {
+            if (this.ADLC.idle && !this.flagFillActive) {
                 this.ADLC.status2 |= 4;
             } else {
                 this.ADLC.status2 &= ~4;
@@ -751,6 +869,28 @@ export class Econet {
     checkForNMI() {
         // Do we need to flag an interrupt?
         let raiseNMI = false;
+
+        // The real chip's IRQ output is a level gated by the RIE/TIE enables, not just by status
+        // edges: turning an enable off drops its latched causes from the output at that moment,
+        // and turning one on while its status condition is already latched asserts IRQ with no
+        // status edge involved. ANFS relies on both when it acks an inbound scout: it masks RIE
+        // (dropping the just-serviced RX interrupt's level so a fresh edge is possible at all),
+        // then enables TIE with TDRA already high and waits for the interrupt to feed the ack
+        // bytes.
+        const newlyDisabled = this.lastNmiControl1 & ~this.ADLC.control1;
+        const newlyEnabled = this.ADLC.control1 & ~this.lastNmiControl1;
+        this.lastNmiControl1 = this.ADLC.control1;
+        if (newlyDisabled & 2) this.irqcause &= ~0x0b; // RIE off: drop RDA, S2RQ, FD
+        if (newlyDisabled & 4) this.irqcause &= ~0x70; // TIE off: drop CTS, TXU, TDRA
+        if (this.irqcause === 0) this.ADLC.status1 &= ~128;
+        let enableCause = 0;
+        if (newlyEnabled & 4) enableCause |= this.ADLC.status1 & 0x70; // TIE: CTS, TXU, TDRA
+        if (enableCause) {
+            raiseNMI = true;
+            this.irqcause |= enableCause;
+            this.ADLC.status1 |= 128;
+        }
+
         if (this.ADLC.status1 !== this.ADLCprev.status1 || this.ADLC.status2 !== this.ADLCprev.status2) {
             // something changed
             let tempcause, temp2;
