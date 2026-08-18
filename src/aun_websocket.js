@@ -52,6 +52,16 @@ export class AunWebSocketTransport {
         this.address = null; // {station, network} once known
         this.nextSequence = 1;
         this.pendingAcks = new Map(); // sequence -> onAcked callback
+        // Ports we've broadcast or sent an immediate op on: a reply to one of these comes back as an
+        // ordinary directed Unicast (aun-filestore always sends type 2 for a non-broadcast
+        // destination), but the Beeb is expecting a direct, handshake-free reply on the wire, not a
+        // normal scout+ack+body+ack.
+        this.pendingReplyPorts = new Set();
+        // Resolves once an address is known (or the connection has given up), so callers that need
+        // a real station number before the machine boots (e.g. dynamic allocation) can wait on it.
+        this.addressReady = new Promise((resolve) => {
+            this._resolveAddressReady = resolve;
+        });
     }
 
     /** Wires this transport into an Econet instance and opens the connection. */
@@ -61,8 +71,14 @@ export class AunWebSocketTransport {
         this.ws = new WebSocket(this.url);
         this.ws.addEventListener("open", () => this._onOpen());
         this.ws.addEventListener("message", (event) => this._onMessage(event.data));
-        this.ws.addEventListener("close", () => this._setStatus("closed"));
-        this.ws.addEventListener("error", () => this._setStatus("error"));
+        this.ws.addEventListener("close", () => {
+            this._setStatus("closed");
+            this._resolveAddressReady();
+        });
+        this.ws.addEventListener("error", () => {
+            this._setStatus("error");
+            this._resolveAddressReady();
+        });
     }
 
     disconnect() {
@@ -88,6 +104,7 @@ export class AunWebSocketTransport {
         if (this.manualAddress) {
             this.address = this.manualAddress;
             this.econet.setAddress(this.address.station, this.address.network);
+            this._resolveAddressReady();
         } else {
             this._send({ type: "ctrl", request: "dynamic_alloction_request", args: [] });
         }
@@ -107,6 +124,7 @@ export class AunWebSocketTransport {
             this.address = parseAddress(message.response);
             this.econet.setAddress(this.address.station, this.address.network);
             this._setStatus("addressed");
+            this._resolveAddressReady();
             return;
         }
 
@@ -130,18 +148,43 @@ export class AunWebSocketTransport {
             return;
         }
 
+        // Frames are delivered with source network 0, not message.src.network: the Beeb addresses
+        // every station this transport reaches as being on its own local network (it sends to e.g.
+        // 254.0), and the NFS ROM validates a reply's source address against the address it sent
+        // to. The AUN-layer network number (e.g. aun-filestore's own 128) is routing detail that
+        // never appears in the network byte on a real local wire.
         if (frame.aunType === AunType.Unicast) {
-            this.econet.deliverInboundUnicast(
-                message.src.station,
-                message.src.network,
-                frame.controlByte,
-                frame.port,
-                frame.data,
-            );
+            // Every Unicast is acked at the AUN/transport layer immediately on receipt, independent
+            // of whatever the Beeb goes on to do with it — mirrors aun-filestore's own
+            // JsonPacket::buildAck(), which acks unconditionally before dispatching to a service.
+            // Without this, the server's flow-controlled transfers (e.g. GETBYTES/PUTBYTES, which
+            // register an addAckEvent() and wait for it before sending each block) stall forever:
+            // ordinary single-reply FS calls (OPEN, GET_INFO, ...) don't wait on an ack so the gap
+            // wasn't visible until the first data-streaming call.
+            this._send({
+                type: "pkt",
+                src: { station: this.address.station, network: this.address.network },
+                dst: { station: message.src.station, network: message.src.network },
+                payload: typedArrayToBase64(encodeAunFrame(AunType.Ack, 0, 0, frame.sequence, new Uint8Array(0))),
+            });
+
+            if (this.pendingReplyPorts.has(frame.port)) {
+                this.econet.deliverInboundImmediateReply(message.src.station, 0, frame.data);
+            } else {
+                this.econet.deliverInboundUnicast(message.src.station, 0, frame.controlByte, frame.port, frame.data);
+            }
             return;
         }
 
-        // Broadcast/Reject/Immediate/ImmediateReply are not carried over this transport yet.
+        // A reply to sendImmediate(): aun-filestore's WebSocket handler sends a genuine
+        // ImmediateReply-typed frame for this one (unlike a broadcast reply, which it sends as an
+        // ordinary Unicast), so it needs its own branch rather than the pendingReplyPorts check above.
+        if (frame.aunType === AunType.ImmediateReply) {
+            this.econet.deliverInboundImmediateReply(message.src.station, 0, frame.data);
+            return;
+        }
+
+        // Inbound Broadcast/Reject are not carried over this transport yet.
     }
 
     // NetworkTransport interface, called by Econet's wire-state-machine ---------------------
@@ -158,6 +201,52 @@ export class AunWebSocketTransport {
         this.pendingAcks.set(sequence, onAcked);
 
         const aunFrame = encodeAunFrame(AunType.Unicast, port, controlByte, sequence, data);
+        this._send({
+            type: "pkt",
+            src: { station: srcStn, network: srcNet },
+            dst: { station: destStn, network: destNet },
+            payload: typedArrayToBase64(aunFrame),
+        });
+    }
+
+    /**
+     * Broadcasts have no ack/reply handshake on the wire, but still need a fresh sequence number
+     * each time: a repeated broadcast (e.g. Econet's own retry of a query nobody answered yet) must
+     * look like a distinct packet, not a duplicate of the first attempt the server's dedup window
+     * would otherwise silently re-ack without ever re-dispatching to a service for a fresh reply.
+     */
+    sendBroadcast(srcStn, srcNet, controlByte, port, data) {
+        if (this.ws?.readyState !== WebSocket.OPEN || !this.address) return;
+
+        const sequence = this.nextSequence;
+        this.nextSequence = (this.nextSequence + 1) >>> 0;
+        this.pendingReplyPorts.add(port);
+        const aunFrame = encodeAunFrame(AunType.Broadcast, port, controlByte, sequence, data);
+        this._send({
+            type: "pkt",
+            src: { station: srcStn, network: srcNet },
+            dst: { station: 0xff, network: 0xff },
+            payload: typedArrayToBase64(aunFrame),
+        });
+    }
+
+    /**
+     * Immediate operations (machine peek, halt, continue, etc.) have no scout/ack handshake on the
+     * wire either: like a broadcast, the whole frame goes out as a single transmission and any reply
+     * comes back directly (routed via pendingReplyPorts, same as sendBroadcast above).
+     *
+     * controlByte here is the raw Econet frame byte (0x80-0x88: top bit set marks it as an
+     * immediate op at the wire/ADLC level), but AUN's control field for an Immediate packet is just
+     * the op code itself (aun-filestore's JsonPacket checks iCb==0/1/8 unmasked), so the top bit is
+     * stripped before it goes out.
+     */
+    sendImmediate(destStn, destNet, srcStn, srcNet, controlByte, port, data) {
+        if (this.ws?.readyState !== WebSocket.OPEN || !this.address) return;
+
+        const sequence = this.nextSequence;
+        this.nextSequence = (this.nextSequence + 1) >>> 0;
+        this.pendingReplyPorts.add(port);
+        const aunFrame = encodeAunFrame(AunType.Immediate, port, controlByte & 0x7f, sequence, data);
         this._send({
             type: "pkt",
             src: { station: srcStn, network: srcNet },
