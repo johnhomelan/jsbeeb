@@ -103,6 +103,13 @@ export class Cmos {
         }
     }
 
+    /** Updates the Econet station id byte once a dynamically-allocated address is known: the
+     *  constructor runs before a remote transport has had a chance to negotiate one. */
+    setEconetStation(stationId) {
+        this.store[0xe] = stationId;
+        this.save();
+    }
+
     read() {
         if (!this.enabled) return 0xff;
         // To drive the bus we need:
