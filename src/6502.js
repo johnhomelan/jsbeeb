@@ -943,7 +943,14 @@ export class Cpu6502 extends Base6502 {
                 if (!this.model.isMaster) return this.fdc.read(addr);
                 break;
             case 0xfea0:
-                // Econet status register
+            case 0xfea4:
+            case 0xfea8:
+            case 0xfeac:
+            case 0xfeb0:
+            case 0xfeb4:
+            case 0xfeb8:
+            case 0xfebc:
+                // Econet status register, mirrored across $FEA0-$FEBF as only 2 address lines are decoded
                 if (this.econet) {
                     return this.econet.readRegister(addr & 3);
                 }
@@ -1451,10 +1458,16 @@ export class Cpu6502 extends Base6502 {
         const musicStuff = this.music5000 ? (cycles) => this.music5000.polltime(cycles) : nop;
         const econetStuff = this.econet
             ? (cycles) => {
-                  const donmi = this.econet.polltime(cycles);
-                  if (donmi && this.econet.econetNMIEnabled) {
-                      this.NMI(true);
-                  }
+                  this.econet.polltime(cycles);
+                  // The ADLC's IRQ output is a level, not a pulse: NMI() only raises a fresh
+                  // interrupt on a low-to-high transition, so this must track status1's IRQ bit
+                  // (checkForNMI() clears it once the cause has gone) rather than only ever
+                  // asserting, or a second Econet interrupt could never be delivered. The enable
+                  // latch gates the level itself (not just whether we bother syncing it): masking
+                  // must drop the CPU-visible level immediately, so a cause that clears and comes
+                  // back while masked still produces a fresh edge once unmasked, instead of finding
+                  // the level already stuck high from an interrupt that was serviced long ago.
+                  this.NMI(this.econet.econetNMIEnabled && !!(this.econet.ADLC.status1 & 128));
                   this.filestore?.polltime(cycles);
               }
             : nop;
