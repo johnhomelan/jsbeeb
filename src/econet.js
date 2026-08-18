@@ -317,6 +317,7 @@ export class Econet {
                             this.presentFrame(
                                 new EconetPacket(this.stationId, this.network, pending.buffer[2], pending.buffer[3]),
                             );
+                            this.advanceState(this.FWH_RX_ScoutAck_Received); // reset timer
                             break;
                         case this.FWH_TX_Scout_Sent:
                             // The transport never confirmed our outbound body; fall back to a bare
@@ -324,6 +325,7 @@ export class Econet {
                             this.presentFrame(
                                 new EconetPacket(this.stationId, this.network, this.txDestStn, this.txDestNet),
                             );
+                            this.advanceState(this.FWH_TX_Scout_Sent); // reset timer
                             break;
                     }
                 } else {
