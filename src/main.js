@@ -309,6 +309,7 @@ config.setMicrophoneChannel(parsedQuery.microphoneChannel);
 config.setCheckboxes({
     coProcessor: !!parsedQuery.coProcessor,
     hasEconet: !!parsedQuery.hasEconet,
+    econetRemote: !!parsedQuery.econetRemote,
     hasMusic5000: !!parsedQuery.hasMusic5000,
     hasTeletextAdaptor: !!parsedQuery.hasTeletextAdaptor,
     mouseJoystickEnabled: !!parsedQuery.mouseJoystickEnabled,
@@ -772,18 +773,22 @@ window.addEventListener("beforeunload", function (event) {
     }
 });
 
+let econetTransport = null;
 if (config.hasEconet) {
-    econet = new Econet(stationId, model.cyclesPerSecond);
+    // Dynamic allocation only makes sense for a remote transport: local play has no bridge to ask, so
+    // it always gets a concrete (default or explicit) station id, matching pre-remote-Econet behaviour.
+    const dynamicStation = config.econetRemote && !stationIdExplicit;
+    econet = new Econet(dynamicStation ? undefined : stationId, model.cyclesPerSecond);
     if (config.econetRemote) {
-        const transport = new AunWebSocketTransport(econetWsUrl, {
+        econetTransport = new AunWebSocketTransport(econetWsUrl, {
             station: stationIdExplicit ? stationId : null,
             onStatusChange: (status) => {
                 const el = document.getElementById("econet-status");
                 if (el) el.textContent = `Econet (${econetWsUrl}): ${status}`;
             },
         });
-        econet.setTransport(transport);
-        transport.connect(econet);
+        econet.setTransport(econetTransport);
+        econetTransport.connect(econet);
     }
 } else {
     document.getElementById("fsmenuitem").style.display = "none";
@@ -2161,6 +2166,19 @@ const startPromise = (async () => {
 (async () => {
     try {
         await startPromise;
+
+        if (econetTransport) {
+            // A dynamically-allocated station number arrives over the WebSocket asynchronously; give
+            // it a chance to land before MOS boots and reads it, but don't let a slow or unreachable
+            // server hold up booting indefinitely.
+            const EconetAddressTimeoutMs = 3000;
+            await Promise.race([
+                econetTransport.addressReady,
+                new Promise((resolve) => setTimeout(resolve, EconetAddressTimeoutMs)),
+            ]);
+            // cmos was built before the address resolved, so its Econet station byte is stale.
+            cmos.setEconetStation(econet.stationId);
+        }
 
         switch (needsAutoboot) {
             case "boot":
