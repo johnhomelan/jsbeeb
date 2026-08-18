@@ -153,6 +153,64 @@ describe("AunWebSocketTransport", () => {
         });
     });
 
+    describe("sendImmediate", () => {
+        it("base64-encodes an AUN Immediate frame addressed to the target station", () => {
+            const transport = new AunWebSocketTransport("ws://example/", {});
+            transport.econet = makeFakeEconet();
+            transport.ws = makeFakeSocket();
+            transport.address = { station: 1, network: 130 };
+
+            transport.sendImmediate(254, 128, 1, 130, 0x88, 0, new Uint8Array([0, 0xdb, 0]));
+
+            expect(transport.ws.sent).toHaveLength(1);
+            const [message] = transport.ws.sent;
+            expect(message.type).toBe("pkt");
+            expect(message.dst).toEqual({ station: 254, network: 128 });
+            expect(message.src).toEqual({ station: 1, network: 130 });
+
+            const payload = Uint8Array.from(atob(message.payload), (c) => c.charCodeAt(0));
+            // type=5 (Immediate), port=0, control=0x08 (top bit of the raw 0x88 Econet frame byte
+            // stripped: AUN's control field for an Immediate packet is just the op code), pad=0,
+            // sequence=1 (little-endian), then data.
+            expect(Array.from(payload)).toEqual([5, 0, 0x08, 0, 1, 0, 0, 0, 0, 0xdb, 0]);
+        });
+
+        it("does nothing when not connected", () => {
+            const transport = new AunWebSocketTransport("ws://example/", {});
+            transport.econet = makeFakeEconet();
+
+            expect(() => transport.sendImmediate(254, 128, 1, 130, 0x88, 0, new Uint8Array())).not.toThrow();
+        });
+
+        it("routes an ImmediateReply-typed reply to deliverInboundImmediateReply", () => {
+            const transport = new AunWebSocketTransport("ws://example/", {});
+            transport.econet = makeFakeEconet();
+            transport.econet.deliverInboundImmediateReply = vi.fn();
+            transport.ws = makeFakeSocket();
+            transport.address = { station: 1, network: 130 };
+
+            transport.sendImmediate(254, 128, 1, 130, 0x88, 0, new Uint8Array([0, 0xdb, 0]));
+
+            transport._onMessage(
+                JSON.stringify({
+                    type: "pkt",
+                    src: { station: 254, network: 128 },
+                    dst: { station: 1, network: 130 },
+                    payload: buildAunPayload(6 /* ImmediateReply */, 0, 0, 99, [0x40, 0x66, 1, 25]),
+                }),
+            );
+
+            // Source network is delivered as 0: the Beeb addressed this station on its own local
+            // network, and the ROM validates a reply's source against the address it sent to.
+            expect(transport.econet.deliverInboundImmediateReply).toHaveBeenCalledWith(
+                254,
+                0,
+                new Uint8Array([0x40, 0x66, 1, 25]),
+            );
+            expect(transport.econet.deliverInboundUnicast).not.toHaveBeenCalled();
+        });
+    });
+
     describe("receiving", () => {
         it("delivers an inbound Unicast pkt addressed to us to Econet", () => {
             const transport = new AunWebSocketTransport("ws://example/", {});
@@ -169,13 +227,45 @@ describe("AunWebSocketTransport", () => {
                 }),
             );
 
+            // Source network delivered as 0; see the ImmediateReply test above.
             expect(transport.econet.deliverInboundUnicast).toHaveBeenCalledWith(
                 254,
-                128,
+                0,
                 0x80,
                 0x99,
                 new Uint8Array([1, 2, 3]),
             );
+        });
+
+        it("acks an inbound Unicast pkt immediately, independent of delivery to Econet", () => {
+            // Mirrors aun-filestore's own JsonPacket::buildAck(): every Unicast is acked at the
+            // transport layer on receipt. The server's flow-controlled transfers (GETBYTES,
+            // PUTBYTES, ...) register an addAckEvent() and wait for this before sending each block;
+            // without it those calls hang forever server-side.
+            const transport = new AunWebSocketTransport("ws://example/", {});
+            transport.econet = makeFakeEconet();
+            transport.ws = makeFakeSocket();
+            transport.address = { station: 1, network: 130 };
+
+            transport._onMessage(
+                JSON.stringify({
+                    type: "pkt",
+                    src: { station: 254, network: 128 },
+                    dst: { station: 1, network: 130 },
+                    payload: buildAunPayload(2 /* Unicast */, 0x99, 0x80, 42, [1, 2, 3]),
+                }),
+            );
+
+            expect(transport.ws.sent).toHaveLength(1);
+            const [ack] = transport.ws.sent;
+            expect(ack.type).toBe("pkt");
+            expect(ack.src).toEqual({ station: 1, network: 130 });
+            expect(ack.dst).toEqual({ station: 254, network: 128 });
+
+            const payload = Uint8Array.from(atob(ack.payload), (c) => c.charCodeAt(0));
+            // type=3 (Ack), port=0, control=0, pad=0, sequence=42 (little-endian, echoed from the
+            // packet being acked), no data.
+            expect(Array.from(payload)).toEqual([3, 0, 0, 0, 42, 0, 0, 0]);
         });
 
         it("ignores a pkt addressed to a different station", () => {

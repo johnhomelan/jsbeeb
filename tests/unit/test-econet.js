@@ -78,6 +78,39 @@ describe("Econet", () => {
             expect(econet.wireState).toBe(econet.FWH_Idle);
         });
 
+        it("routes an immediate operation (e.g. machine peek) through a transport that supports it", () => {
+            const transport = makeFakeTransport();
+            transport.immediates = [];
+            transport.sendImmediate = (destStn, destNet, srcStn, srcNet, controlByte, port, data) => {
+                transport.immediates.push({
+                    destStn,
+                    destNet,
+                    srcStn,
+                    srcNet,
+                    controlByte,
+                    port,
+                    data: Array.from(data),
+                });
+            };
+            econet.setTransport(transport);
+
+            sendFrame(econet, [254, 0, 101, 0, 0x88, 0, 0, 0, 0xdb, 0]);
+
+            expect(transport.immediates).toEqual([
+                { destStn: 254, destNet: 0, srcStn: 101, srcNet: 0, controlByte: 0x88, port: 0, data: [0, 0, 0xdb, 0] },
+            ]);
+            expect(econet.beebRx.bytesInBuffer).toBe(0); // no canned local reply was synthesised
+        });
+
+        it("falls back to a canned local reply when the transport doesn't support immediate ops", () => {
+            const transport = makeFakeTransport(); // no sendImmediate
+            econet.setTransport(transport);
+
+            sendFrame(econet, [254, 0, 101, 0, 0x88, 0, 0, 0, 0xdb, 0]);
+
+            expect(Array.from(econet.beebRx.buffer.slice(0, 8))).toEqual([101, 0, 254, 0, 1, 0, 0x60, 0x03]);
+        });
+
         it("keeps offering the Beeb a fallback ack if the transport never confirms the body", () => {
             const transport = makeFakeTransport();
             transport.sendUnicast = () => {}; // never calls onAcked
@@ -97,6 +130,18 @@ describe("Econet", () => {
     });
 
     describe("inbound (transport -> Beeb)", () => {
+        it("presents an immediate-op reply as routing bytes plus bare payload, network hardcoded to 0", () => {
+            econet.setAddress(101, 200); // non-zero network, as a real AUN-assigned address would be
+
+            econet.deliverInboundImmediateReply(254, 128, new Uint8Array([0x40, 0x66, 1, 1]));
+
+            // Destination network must be 0 (local-network-only, per real Econet's AP hardware check),
+            // not this.network (the AUN transport's own routing-layer network number). The payload
+            // follows the routing bytes directly: a 2-way exchange's reply has no control/port bytes.
+            expect(econet.beebRx.bytesInBuffer).toBe(8);
+            expect(Array.from(econet.beebRx.buffer.slice(0, 8))).toEqual([101, 0, 254, 128, 0x40, 0x66, 1, 1]);
+        });
+
         it("presents an inbound unicast as a scout addressed from the real sender", () => {
             econet.setAddress(101, 0);
             econet.deliverInboundUnicast(50, 0, 0x80, 0x99, new Uint8Array([1, 2, 3]));
@@ -123,6 +168,75 @@ describe("Econet", () => {
             sendFrame(econet, [50, 0, 101, 0]); // the Beeb's final ack
             expect(econet.wireState).toBe(econet.FWH_Idle);
             expect(econet.inboundQueue).toHaveLength(0);
+        });
+
+        it("holds a frame back while the Beeb keeps its receiver in reset", () => {
+            econet.writeRegister(0, 64); // RxReset on, as the driver holds it during its own tx
+            econet.polltime(200);
+
+            econet.deliverInboundImmediateReply(254, 0, new Uint8Array([0x40, 0x66, 1, 1]));
+            econet.polltime(200);
+            expect(econet.beebRx.bytesInBuffer).toBe(0); // RxReset would have wiped it
+
+            econet.writeRegister(0, 0); // receiver back on
+            econet.polltime(200);
+            expect(Array.from(econet.beebRx.buffer.slice(0, 8))).toEqual([101, 0, 254, 0, 0x40, 0x66, 1, 1]);
+        });
+
+        it("doesn't let a queued inbound scout overwrite an unread ack", () => {
+            const transport = makeFakeTransport();
+            econet.setTransport(transport);
+
+            sendFrame(econet, [50, 0, 101, 0, 0x80, 0x99]); // scout
+            sendFrame(econet, [0, 0, 0, 0, 1, 2, 3]); // body; fake transport acks synchronously
+            expect(econet.wireState).toBe(econet.FWH_Idle);
+            expect(econet.beebRx.bytesInBuffer).toBe(4); // the ack, not yet read by the Beeb
+
+            // A reply arrives before the Beeb has read the ack; it must queue, not clobber.
+            econet.deliverInboundUnicast(50, 0, 0x80, 0x90, new Uint8Array([5, 0]));
+            econet.polltime(200);
+            expect(econet.wireState).toBe(econet.FWH_Idle);
+            expect(econet.beebRx.bytesInBuffer).toBe(4);
+
+            // Drain the ack the way the CPU would: let receive() shift it into the fifo and
+            // read it out of the data register until nothing is left.
+            for (let guard = 0; guard < 100 && (econet.beebRx.bytesInBuffer || econet.ADLC.rxfptr); guard++) {
+                econet.polltime(econet.TIME_BETWEEN_BYTES);
+                while (econet.ADLC.rxfptr) econet.readRegister(2);
+            }
+            econet.writeRegister(0, 32); // clear RX status/frame, as the driver does after a frame
+
+            econet.polltime(200);
+            expect(econet.wireState).toBe(econet.FWH_RX_Scout_Received);
+            expect(Array.from(econet.beebRx.buffer.slice(0, 6))).toEqual([101, 0, 50, 0, 0x80, 0x90]);
+        });
+    });
+
+    describe("flag fill", () => {
+        it("shows flags (FD), not an idle line, while a sent frame awaits its reply", () => {
+            const transport = makeFakeTransport();
+            transport.sendImmediate = () => {}; // no reply yet: the far end is thinking
+            econet.setTransport(transport);
+
+            sendFrame(econet, [254, 0, 101, 0, 0x88, 0, 0, 0, 0xdb, 0]);
+            econet.polltime(200);
+
+            expect(econet.ADLC.status1 & 8).toBe(8); // FD
+            expect(econet.ADLC.status2 & 4).toBe(0); // no RxIdle
+
+            econet.deliverInboundImmediateReply(254, 0, new Uint8Array([0x40, 0x66, 1, 1]));
+            econet.polltime(200);
+            expect(econet.ADLC.status1 & 8).toBe(0);
+        });
+    });
+
+    describe("interrupts", () => {
+        it("raises an NMI when an interrupt enable is turned on with its cause already latched", () => {
+            econet.polltime(200);
+            expect(econet.ADLC.status1 & 64).toBe(64); // TDRA already high, TIE off, no NMI yet
+
+            econet.writeRegister(0, 4); // TIE on
+            expect(econet.polltime(200)).toBe(true);
         });
     });
 
