@@ -231,6 +231,41 @@ describe("Econet", () => {
             expect(econet.wireState).toBe(econet.FWH_RX_Scout_Received);
             expect(Array.from(econet.beebRx.buffer.slice(0, 6))).toEqual([101, 0, 50, 0, 0x80, 0x90]);
         });
+
+        it("doesn't read as idle, or latch SR2b2, while a delivered frame is queued but not yet presented", () => {
+            // A second reply that arrives hot on the heels of the first (e.g. GETBYTES's own
+            // immediate-ack followed by its "no more data" reply, both tiny) can be queued here
+            // before polltime() gets around to presenting it. That's a gap in our own polling,
+            // not a real gap on the wire: the far end is actively sending, not idle. Reading it
+            // as idle anyway spuriously latches SR2b2 (Inactive Idle Received) and derails the
+            // ROM's scout-ack routine for the very frame that's about to be presented.
+            const transport = makeFakeTransport();
+            econet.setTransport(transport);
+
+            sendFrame(econet, [50, 0, 101, 0, 0x80, 0x99]); // scout
+            sendFrame(econet, [0, 0, 0, 0, 1, 2, 3]); // body; fake transport acks synchronously
+            expect(econet.wireState).toBe(econet.FWH_Idle);
+
+            // Drain the ack the way the CPU would.
+            for (let guard = 0; guard < 100 && (econet.beebRx.bytesInBuffer || econet.ADLC.rxfptr); guard++) {
+                econet.polltime(econet.TIME_BETWEEN_BYTES);
+                while (econet.ADLC.rxfptr) econet.readRegister(2);
+            }
+            // Mirror the ROM's own scout-ack dance: RxReset on (clears FV via updateRegisters'
+            // CR2b5 handling), then re-armed with RIE and RxReset off.
+            econet.writeRegister(0, 68); // RxReset + TIE
+            econet.polltime(10);
+            econet.writeRegister(0, 130); // RIE, RxReset off
+            econet.polltime(10);
+
+            // The next reply has already arrived and is queued, but polltime() hasn't presented
+            // its scout yet.
+            econet.deliverInboundUnicast(50, 0, 0x80, 0x90, new Uint8Array([5, 0]));
+            econet.updateIdle();
+            expect(econet.ADLC.idle).toBe(false);
+            econet.status();
+            expect(econet.ADLC.status2 & 4).toBe(0); // SR2b2 not latched
+        });
     });
 
     describe("flag fill", () => {

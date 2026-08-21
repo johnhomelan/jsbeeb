@@ -737,12 +737,22 @@ export class Econet {
     // a frame delivered between receive() passes must stop the line reading as idle straight
     // away, or the ROM sees a stale "Inactive Idle Received" and gives up on the reply it was
     // waiting for.
+    //
+    // inboundQueue.length also has to be 0: a frame the transport has already delivered but
+    // this station hasn't presented yet (still waiting on doorstepClear in polltime()) means the
+    // far end is actively transmitting, not idle — this is purely a gap in our own polling
+    // granularity, not a real gap on the wire. Presenting it one tick later than it logically
+    // arrived is invisible to the Beeb; but if this queued-and-not-yet-presented moment reads as
+    // idle, acking a scout that arrives fast on its heels (e.g. the two small back-to-back
+    // replies GETBYTES sends for a zero-byte "no more data" call) can latch a spurious Inactive
+    // Idle Received mid-handshake and derail the ROM's own scout-ack routine.
     updateIdle() {
         this.ADLC.idle =
             !(this.ADLC.control1 & 0x40) && // not rxreset
             !this.ADLC.rxfptr && // nothing in fifo
             !(this.ADLC.status2 & 2) && // no FV
-            this.beebRx.bytesInBuffer === 0; // nothing waiting to be shifted in
+            this.beebRx.bytesInBuffer === 0 && // nothing waiting to be shifted in
+            this.inboundQueue.length === 0; // nothing already delivered but not yet presented
     }
 
     status() {
