@@ -147,13 +147,23 @@ export class Econet {
      * this station. Queued rather than delivered immediately: the handshake still has to walk the
      * Beeb through scout -> scout-ack -> body -> body-ack exactly as it would for a real frame
      * arriving over the wire.
+     *
+     * `onDelivered`, if given, fires once this specific frame's local handshake reaches the final
+     * body-ack (inboundQueue.shift() below) rather than as soon as the transport received it. A
+     * flow-controlled multi-block transfer (GETBYTES/PUTBYTES) gates each further block on an
+     * AUN-layer ack of the previous one; acking before the Beeb has even seen the frame lets the
+     * server race ahead and send the next block before the ROM's one-shot RXCB for this port is
+     * re-armed (real Econet's four-way handshake is wire-synchronous, so this can't happen there —
+     * see the acorn-nfs ANFS 4.25 disassembly's note on rx_complete_update_rxcb). The Beeb then
+     * finds no listener for the next scout and silently discards it, stalling the transfer forever.
      */
-    deliverInboundUnicast(srcStn, srcNet, controlByte, port, data) {
+    deliverInboundUnicast(srcStn, srcNet, controlByte, port, data, onDelivered) {
         const pkt = new EconetPacket(this.stationId, this.network, srcStn, srcNet);
         pkt.buffer.set(data, 4);
         pkt.bytesInBuffer = 4 + data.length;
         pkt.controlFlag = controlByte;
         pkt.port = port;
+        pkt.onDelivered = onDelivered;
         this.inboundQueue.push(pkt);
         this.econetStateChanged = true;
     }
@@ -615,7 +625,8 @@ export class Econet {
 
                         if (this.wireState === this.FWH_RX_Body_Received) {
                             // 3 - RX Body received - waiting for final ack
-                            this.inboundQueue.shift();
+                            const delivered = this.inboundQueue.shift();
+                            delivered.onDelivered?.();
                             this.advanceState(this.FWH_Idle);
                         }
                     }

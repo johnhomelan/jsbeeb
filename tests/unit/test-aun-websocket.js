@@ -227,21 +227,27 @@ describe("AunWebSocketTransport", () => {
                 }),
             );
 
-            // Source network delivered as 0; see the ImmediateReply test above.
+            // Source network delivered as 0; see the ImmediateReply test above. The 5th argument is
+            // the onDelivered callback (see the next test) that fires the AUN ack.
             expect(transport.econet.deliverInboundUnicast).toHaveBeenCalledWith(
                 254,
                 0,
                 0x80,
                 0x99,
                 new Uint8Array([1, 2, 3]),
+                expect.any(Function),
             );
         });
 
-        it("acks an inbound Unicast pkt immediately, independent of delivery to Econet", () => {
-            // Mirrors aun-filestore's own JsonPacket::buildAck(): every Unicast is acked at the
-            // transport layer on receipt. The server's flow-controlled transfers (GETBYTES,
-            // PUTBYTES, ...) register an addAckEvent() and wait for this before sending each block;
-            // without it those calls hang forever server-side.
+        it("acks an inbound Unicast pkt only once Econet's local handshake for it completes", () => {
+            // Mirrors aun-filestore's own JsonPacket::buildAck() in spirit (every Unicast is
+            // eventually acked at the transport layer), but not on receipt: acking before the Beeb's
+            // own scout/ack/body/ack handshake for this frame finishes would let the server's
+            // flow-controlled transfers (GETBYTES, PUTBYTES, ...) race ahead and send the next block
+            // before the ROM has re-armed to receive it (real Econet's four-way handshake is
+            // wire-synchronous, so this can't happen there). The ack is threaded through as
+            // deliverInboundUnicast's onDelivered callback instead, fired by Econet once it's done
+            // walking the Beeb through that handshake.
             const transport = new AunWebSocketTransport("ws://example/", {});
             transport.econet = makeFakeEconet();
             transport.ws = makeFakeSocket();
@@ -255,6 +261,11 @@ describe("AunWebSocketTransport", () => {
                     payload: buildAunPayload(2 /* Unicast */, 0x99, 0x80, 42, [1, 2, 3]),
                 }),
             );
+
+            expect(transport.ws.sent).toHaveLength(0);
+            const onDelivered = transport.econet.deliverInboundUnicast.mock.calls[0][5];
+
+            onDelivered();
 
             expect(transport.ws.sent).toHaveLength(1);
             const [ack] = transport.ws.sent;
@@ -308,6 +319,25 @@ describe("AunWebSocketTransport", () => {
                         src: { station: 254, network: 128 },
                         dst: { station: 1, network: 130 },
                         payload: "not valid base64!!!",
+                    }),
+                ),
+            ).not.toThrow();
+            expect(transport.econet.deliverInboundUnicast).not.toHaveBeenCalled();
+        });
+
+        it("discards a pkt with a null payload without throwing", () => {
+            const transport = new AunWebSocketTransport("ws://example/", {});
+            transport.econet = makeFakeEconet();
+            transport.ws = makeFakeSocket();
+            transport.address = { station: 1, network: 130 };
+
+            expect(() =>
+                transport._onMessage(
+                    JSON.stringify({
+                        type: "pkt",
+                        src: { station: 254, network: 128 },
+                        dst: { station: 1, network: 130 },
+                        payload: null,
                     }),
                 ),
             ).not.toThrow();

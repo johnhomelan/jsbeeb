@@ -130,6 +130,10 @@ export class AunWebSocketTransport {
 
         if (message.type !== "pkt" || !this.address) return;
         if (message.dst?.station !== this.address.station || message.dst?.network !== this.address.network) return;
+        // aun-filestore sends some pkt messages with a null payload (observed after every Unicast
+        // reply); they carry no AUN frame to decode, so skip them rather than let atob(null) coerce
+        // to the string "null" and fail confusingly inside decodeAunFrame.
+        if (typeof message.payload !== "string") return;
 
         let frame;
         try {
@@ -154,24 +158,38 @@ export class AunWebSocketTransport {
         // to. The AUN-layer network number (e.g. aun-filestore's own 128) is routing detail that
         // never appears in the network byte on a real local wire.
         if (frame.aunType === AunType.Unicast) {
-            // Every Unicast is acked at the AUN/transport layer immediately on receipt, independent
-            // of whatever the Beeb goes on to do with it — mirrors aun-filestore's own
-            // JsonPacket::buildAck(), which acks unconditionally before dispatching to a service.
-            // Without this, the server's flow-controlled transfers (e.g. GETBYTES/PUTBYTES, which
-            // register an addAckEvent() and wait for it before sending each block) stall forever:
-            // ordinary single-reply FS calls (OPEN, GET_INFO, ...) don't wait on an ack so the gap
-            // wasn't visible until the first data-streaming call.
-            this._send({
-                type: "pkt",
-                src: { station: this.address.station, network: this.address.network },
-                dst: { station: message.src.station, network: message.src.network },
-                payload: typedArrayToBase64(encodeAunFrame(AunType.Ack, 0, 0, frame.sequence, new Uint8Array(0))),
-            });
+            const sendAck = () =>
+                this._send({
+                    type: "pkt",
+                    src: { station: this.address.station, network: this.address.network },
+                    dst: { station: message.src.station, network: message.src.network },
+                    payload: typedArrayToBase64(encodeAunFrame(AunType.Ack, 0, 0, frame.sequence, new Uint8Array(0))),
+                });
 
             if (this.pendingReplyPorts.has(frame.port)) {
+                // A reply to our own broadcast/immediate op: no local handshake follows (see
+                // deliverInboundImmediateReply), so there's no "Beeb has actually received it" event
+                // to defer to. Ack immediately, as aun-filestore's own JsonPacket::buildAck() does.
+                sendAck();
                 this.econet.deliverInboundImmediateReply(message.src.station, 0, frame.data);
             } else {
-                this.econet.deliverInboundUnicast(message.src.station, 0, frame.controlByte, frame.port, frame.data);
+                // Deferred until the Beeb's own scout/ack/body/ack handshake for this exact frame
+                // finishes (deliverInboundUnicast's onDelivered), not sent as soon as the WebSocket
+                // message arrives. Real Econet's four-way handshake is wire-synchronous: the far end
+                // cannot start a next transaction until this one's local handshake is done, so a
+                // flow-controlled multi-block transfer (GETBYTES/PUTBYTES) never gets ahead of the
+                // Beeb. Acking here immediately (as this used to) breaks that: the server races ahead
+                // and sends the next block before the ROM's one-shot RXCB for this port is re-armed
+                // (see the acorn-nfs ANFS disassembly's note on rx_complete_update_rxcb), so the next
+                // scout finds no listener and is silently discarded, stalling the transfer forever.
+                this.econet.deliverInboundUnicast(
+                    message.src.station,
+                    0,
+                    frame.controlByte,
+                    frame.port,
+                    frame.data,
+                    sendAck,
+                );
             }
             return;
         }

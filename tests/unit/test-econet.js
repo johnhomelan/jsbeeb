@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { Econet } from "../../src/econet.js";
 
 function makeFakeTransport() {
@@ -168,6 +168,27 @@ describe("Econet", () => {
             sendFrame(econet, [50, 0, 101, 0]); // the Beeb's final ack
             expect(econet.wireState).toBe(econet.FWH_Idle);
             expect(econet.inboundQueue).toHaveLength(0);
+        });
+
+        it("fires onDelivered only once the Beeb's own final ack completes the handshake, not on arrival", () => {
+            // A transport (e.g. AunWebSocketTransport) uses this to defer its own AUN-layer ack: a
+            // flow-controlled multi-block transfer must not let the far end send the next block until
+            // the Beeb has actually finished receiving this one, or the ROM's one-shot RXCB for that
+            // port isn't re-armed yet when the next scout arrives.
+            econet.setAddress(101, 0);
+            const onDelivered = vi.fn();
+            econet.deliverInboundUnicast(50, 0, 0x80, 0x99, new Uint8Array([1, 2, 3]), onDelivered);
+            econet.polltime(200);
+            expect(onDelivered).not.toHaveBeenCalled();
+
+            sendFrame(econet, [50, 0, 101, 0]); // the Beeb's 4-byte scout ack
+            expect(onDelivered).not.toHaveBeenCalled();
+
+            econet.polltime(200);
+            expect(onDelivered).not.toHaveBeenCalled();
+
+            sendFrame(econet, [50, 0, 101, 0]); // the Beeb's final ack
+            expect(onDelivered).toHaveBeenCalledTimes(1);
         });
 
         it("holds a frame back while the Beeb keeps its receiver in reset", () => {
